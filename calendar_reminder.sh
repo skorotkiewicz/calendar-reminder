@@ -1,10 +1,10 @@
 #!/bin/bash
 
 # Configuration
-ICS_FILE="$HOME/calendar.ics"  # Path to .ics file
-CHECK_INTERVAL=60              # Check every 60 seconds
-REMINDER_TIME=900              # Reminder 15 minutes before (in seconds)
-NOTIFICATION_ICON="calendar"   # Notification icon
+ICS_FILE="$HOME/calendar.ics"   # Path to .ics file
+CHECK_INTERVAL=60               # Check every 60 seconds
+REMINDER_TIME=900               # Reminder 15 minutes before (in seconds)
+NOTIFICATION_ICON="calendar"    # Notification icon
 TEMP_DIR="/tmp/calendar_reminder"
 
 # Create temporary directory
