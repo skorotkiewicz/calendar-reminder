@@ -49,7 +49,14 @@ parse_ics() {
             if ($i ~ /^DTSTART/) {
                 dtstart = $i
                 gsub(/^DTSTART[^:]*:/, "", dtstart)
-                gsub(/[TZ].*$/, "", dtstart)
+                # Handle both DATE and DATETIME formats
+                if (dtstart ~ /T/) {
+                    # DATETIME format: 20250527T003500 or 20250527T003500Z
+                    gsub(/Z$/, "", dtstart)  # Remove Z if present
+                } else {
+                    # DATE format: 20250526 - add default time 00:00
+                    dtstart = dtstart "T0000"
+                }
             }
             if ($i ~ /^LOCATION:/) {
                 location = substr($i, 10)
@@ -59,12 +66,20 @@ parse_ics() {
         }
 
         if (summary != "" && dtstart != "") {
-            # Convert date from YYYYMMDD format to timestamp
+            # Convert date from YYYYMMDDTHHMMSS format to timestamp
             year = substr(dtstart, 1, 4)
             month = substr(dtstart, 5, 2)
             day = substr(dtstart, 7, 2)
-            hour = substr(dtstart, 10, 2)
-            minute = substr(dtstart, 12, 2)
+
+            # Extract time part after T
+            if (dtstart ~ /T/) {
+                timepart = substr(dtstart, index(dtstart, "T") + 1)
+                hour = substr(timepart, 1, 2)
+                minute = substr(timepart, 3, 2)
+            } else {
+                hour = "00"
+                minute = "00"
+            }
 
             if (hour == "") hour = "00"
             if (minute == "") minute = "00"
@@ -93,12 +108,35 @@ show_notification() {
     local notification_file="$TEMP_DIR/notification_$event_id"
     echo "$title|$message" > "$notification_file"
 
+    # Create wrapper scripts for YAD menu actions
+    local details_script="$TEMP_DIR/show_details_$event_id.sh"
+    local close_script="$TEMP_DIR/close_$event_id.sh"
+
+    cat > "$details_script" << EOF
+#!/bin/bash
+TEMP_DIR="$TEMP_DIR"
+event_id="$event_id"
+$(declare -f show_event_details)
+$(declare -f close_notification)
+show_event_details "\$event_id"
+EOF
+    chmod +x "$details_script"
+
+    cat > "$close_script" << EOF
+#!/bin/bash
+TEMP_DIR="$TEMP_DIR"
+event_id="$event_id"
+$(declare -f close_notification)
+close_notification "\$event_id"
+EOF
+    chmod +x "$close_script"
+
     # YAD notification icon
     yad --notification \
         --image="$NOTIFICATION_ICON" \
         --text="Reminder: $title" \
-        --menu="Show details!show_event_details $event_id!gtk-info|Close!close_notification $event_id!gtk-close" \
-        --command="show_event_details $event_id" &
+        --menu="Show details!$details_script!gtk-info|Close!$close_script!gtk-close" \
+        --command="$details_script" &
 
     echo $! > "$TEMP_DIR/yad_pid_$event_id"
 }
@@ -132,6 +170,8 @@ close_notification() {
     local event_id="$1"
     local pid_file="$TEMP_DIR/yad_pid_$event_id"
     local notification_file="$TEMP_DIR/notification_$event_id"
+    local details_script="$TEMP_DIR/show_details_$event_id.sh"
+    local close_script="$TEMP_DIR/close_$event_id.sh"
 
     # Kill YAD process
     if [[ -f "$pid_file" ]]; then
@@ -140,8 +180,8 @@ close_notification() {
         rm -f "$pid_file"
     fi
 
-    # Remove notification file
-    rm -f "$notification_file"
+    # Remove notification file and scripts
+    rm -f "$notification_file" "$details_script" "$close_script"
 }
 
 # Export functions for YAD
@@ -170,8 +210,8 @@ main_loop() {
                 local event_id=$(echo "${summary}_${event_timestamp}" | md5sum | cut -d' ' -f1)
                 local time_diff=$((event_timestamp - current_time))
 
-                # Check if it's time for reminder
-                if [[ $time_diff -le $REMINDER_TIME && $time_diff -gt 0 ]]; then
+                # Check if it's time for reminder (or if event is soon and we haven't notified yet)
+                if [[ $time_diff -le $REMINDER_TIME && $time_diff -gt -300 ]]; then  # Notify up to 5 minutes after event starts
                     # Check if already processed
                     local already_processed=false
                     for processed in "${processed_events[@]}"; do
@@ -195,10 +235,17 @@ main_loop() {
 
                         notification_text="$notification_text\n\nTime: $datetime"
 
-                        if [[ $time_left -gt 0 ]]; then
+                        if [[ $time_diff -gt 60 ]]; then
                             notification_text="$notification_text\nTime remaining: ${time_left} minutes"
-                        else
-                            notification_text="$notification_text\nEVENT IS NOW!"
+                        elif [[ $time_diff -gt 0 ]]; then
+                            notification_text="$notification_text\nEvent starts in less than 1 minute!"
+                        elif [[ $time_diff -ge -300 ]]; then
+                            local minutes_passed=$(( (-time_diff) / 60 ))
+                            if [[ $minutes_passed -eq 0 ]]; then
+                                notification_text="$notification_text\nEVENT IS NOW!"
+                            else
+                                notification_text="$notification_text\nEvent started ${minutes_passed} minutes ago"
+                            fi
                         fi
 
                         echo "$(date): Sending reminder: $summary"
