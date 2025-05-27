@@ -1,10 +1,10 @@
 #!/bin/bash
 
 # Configuration
-ICS_FILE="$HOME/calendar.ics"  # Path to .ics file
-CHECK_INTERVAL=60              # Check every 60 seconds
-REMINDER_TIME=900              # Reminder 15 minutes before (in seconds)
-NOTIFICATION_ICON="calendar"   # Notification icon
+ICS_FILE="$HOME/calendar.ics"   # Path to .ics file
+CHECK_INTERVAL=60               # Check every 60 seconds
+REMINDER_TIME=900               # Reminder 15 minutes before (in seconds)
+NOTIFICATION_ICON="calendar"    # Notification icon
 TEMP_DIR="/tmp/calendar_reminder"
 
 # Create temporary directory
@@ -48,8 +48,20 @@ parse_ics() {
             }
             if ($i ~ /^DTSTART/) {
                 dtstart = $i
+                is_all_day = ($i ~ /VALUE=DATE/)
                 gsub(/^DTSTART[^:]*:/, "", dtstart)
-                gsub(/[TZ].*$/, "", dtstart)
+                # Handle both DATE and DATETIME formats
+                if (match(dtstart, /T/) > 0) {
+                    # DATETIME format: 20250527T003500 or 20250527T003500Z
+                    gsub(/Z$/, "", dtstart)  # Remove Z if present
+                } else {
+                    # DATE format: 20250526 - for all-day events, set to morning of same day
+                    if (is_all_day == 1) {
+                        dtstart = dtstart "T0800"  # 08:00 for all-day event notification
+                    } else {
+                        dtstart = dtstart "T0000"
+                    }
+                }
             }
             if ($i ~ /^LOCATION:/) {
                 location = substr($i, 10)
@@ -58,18 +70,26 @@ parse_ics() {
             }
         }
 
-        if (summary != "" && dtstart != "") {
-            # Convert date from YYYYMMDD format to timestamp
+        if (length(summary) > 0 && length(dtstart) > 0) {
+            # Convert date from YYYYMMDDTHHMMSS format to timestamp
             year = substr(dtstart, 1, 4)
             month = substr(dtstart, 5, 2)
             day = substr(dtstart, 7, 2)
-            hour = substr(dtstart, 10, 2)
-            minute = substr(dtstart, 12, 2)
+
+            # Extract time part after T
+            if (match(dtstart, /T/) > 0) {
+                timepart = substr(dtstart, index(dtstart, "T") + 1)
+                hour = substr(timepart, 1, 2)
+                minute = substr(timepart, 3, 2)
+            } else {
+                hour = "00"
+                minute = "00"
+            }
 
             if (hour == "") hour = "00"
             if (minute == "") minute = "00"
 
-            printf "%s|%s|%s|%s-%s-%s %s:%s\n", summary, description, location, year, month, day, hour, minute
+            printf "%s|%s|%s|%s-%s-%s %s:%s|%s\n", summary, description, location, year, month, day, hour, minute, (is_all_day == 1 ? "all-day" : "timed")
         }
     }' "$ics_file"
 }
@@ -87,18 +107,41 @@ show_notification() {
     local event_id="$3"
 
     # fyi notification
-    fyi -i "$NOTIFICATION_ICON" -t 10000 "$title" "$message"
+    fyi -i "$NOTIFICATION_ICON" -t 10000 "$title" "${message//\\n/}"
 
     # Create icon in panel with YAD
     local notification_file="$TEMP_DIR/notification_$event_id"
     echo "$title|$message" > "$notification_file"
 
+    # Create wrapper scripts for YAD menu actions
+    local details_script="$TEMP_DIR/show_details_$event_id.sh"
+    local close_script="$TEMP_DIR/close_$event_id.sh"
+
+    cat > "$details_script" << EOF
+#!/bin/bash
+TEMP_DIR="$TEMP_DIR"
+event_id="$event_id"
+$(declare -f show_event_details)
+$(declare -f close_notification)
+show_event_details "\$event_id"
+EOF
+    chmod +x "$details_script"
+
+    cat > "$close_script" << EOF
+#!/bin/bash
+TEMP_DIR="$TEMP_DIR"
+event_id="$event_id"
+$(declare -f close_notification)
+close_notification "\$event_id"
+EOF
+    chmod +x "$close_script"
+
     # YAD notification icon
     yad --notification \
         --image="$NOTIFICATION_ICON" \
         --text="Reminder: $title" \
-        --menu="Show details!show_event_details $event_id!gtk-info|Close!close_notification $event_id!gtk-close" \
-        --command="show_event_details $event_id" &
+        --menu="Show details!$details_script!gtk-info|Close!$close_script!gtk-close" \
+        --command="$details_script" &
 
     echo $! > "$TEMP_DIR/yad_pid_$event_id"
 }
@@ -132,6 +175,8 @@ close_notification() {
     local event_id="$1"
     local pid_file="$TEMP_DIR/yad_pid_$event_id"
     local notification_file="$TEMP_DIR/notification_$event_id"
+    local details_script="$TEMP_DIR/show_details_$event_id.sh"
+    local close_script="$TEMP_DIR/close_$event_id.sh"
 
     # Kill YAD process
     if [[ -f "$pid_file" ]]; then
@@ -140,13 +185,95 @@ close_notification() {
         rm -f "$pid_file"
     fi
 
-    # Remove notification file
-    rm -f "$notification_file"
+    # Remove notification file and scripts
+    rm -f "$notification_file" "$details_script" "$close_script"
 }
 
 # Export functions for YAD
 export -f show_event_details
 export -f close_notification
+
+# Function to check and send notifications
+check_and_notify() {
+    local processed_events=("$@")
+    local current_time=$(date +%s)
+    local events_found=false
+    local new_processed=()
+
+    # Parse events
+    while IFS='|' read -r summary description location datetime event_type; do
+        if [[ -n "$summary" && -n "$datetime" ]]; then
+            events_found=true
+            local event_timestamp=$(date_to_timestamp "$datetime")
+            local event_id=$(echo "${summary}_${event_timestamp}" | md5sum | cut -d' ' -f1)
+            local time_diff=$((event_timestamp - current_time))
+
+            # Check if it's time for reminder
+            local notify_window=-300  # Default: notify up to 5 minutes after event starts
+            if [[ "$event_type" == "all-day" ]]; then
+                notify_window=-86400  # For all-day events: notify up to 24 hours after
+            fi
+
+            if [[ $time_diff -le $REMINDER_TIME && $time_diff -gt $notify_window ]]; then
+                # Check if already processed
+                local already_processed=false
+                for processed in "${processed_events[@]}"; do
+                    if [[ "$processed" == "$event_id" ]]; then
+                        already_processed=true
+                        break
+                    fi
+                done
+
+                if [[ "$already_processed" == false ]]; then
+                    local time_left=$((time_diff / 60))
+                    local notification_text="$summary"
+
+                    if [[ -n "$location" ]]; then
+                        notification_text="$notification_text\nLocation: $location"
+                    fi
+
+                    if [[ -n "$description" ]]; then
+                        notification_text="$notification_text\n\n$description"
+                    fi
+
+                    # Format notification based on event type
+                    if [[ "$event_type" == "all-day" ]]; then
+                        # Extract date and format for all-day events
+                        local event_date=$(echo "$datetime" | cut -d' ' -f1)
+                        notification_text="$notification_text\n\nAll-day event: $event_date"
+                        notification_text="$notification_text\nReminder for today's all-day event"
+                    else
+                        notification_text="$notification_text\n\nTime: $datetime"
+
+                        if [[ $time_diff -gt 60 ]]; then
+                            notification_text="$notification_text\nTime remaining: ${time_left} minutes"
+                        elif [[ $time_diff -gt 0 ]]; then
+                            notification_text="$notification_text\nEvent starts in less than 1 minute!"
+                        elif [[ $time_diff -ge $notify_window ]]; then
+                            local minutes_passed=$(( (-time_diff) / 60 ))
+                            if [[ $minutes_passed -eq 0 ]]; then
+                                notification_text="$notification_text\nEVENT IS NOW!"
+                            else
+                                notification_text="$notification_text\nEvent started ${minutes_passed} minutes ago"
+                            fi
+                        fi
+                    fi
+
+                    echo "$(date): Sending reminder: $summary"
+                    show_notification "📅 Calendar Reminder" "$notification_text" "$event_id"
+                    new_processed+=("$event_id")
+                fi
+            fi
+        fi
+    done < <(parse_ics "$ICS_FILE")
+
+    if [[ "$events_found" == false && -f "$ICS_FILE" ]]; then
+        echo "$(date): No events found in $ICS_FILE"
+    fi
+
+    # Return new processed events
+    printf '%s\n' "${new_processed[@]}"
+}
 
 # Main program loop
 main_loop() {
@@ -158,60 +285,15 @@ main_loop() {
     echo "Reminder time: $((REMINDER_TIME/60)) minutes before event"
     echo ""
 
+    # Check for immediate notifications on startup
+    echo "Checking for current events..."
+    mapfile -t initial_notifications < <(check_and_notify "${processed_events[@]}")
+    processed_events+=("${initial_notifications[@]}")
+
     while true; do
-        local current_time=$(date +%s)
-        local events_found=false
-
-        # Parse events
-        while IFS='|' read -r summary description location datetime; do
-            if [[ -n "$summary" && -n "$datetime" ]]; then
-                events_found=true
-                local event_timestamp=$(date_to_timestamp "$datetime")
-                local event_id=$(echo "${summary}_${event_timestamp}" | md5sum | cut -d' ' -f1)
-                local time_diff=$((event_timestamp - current_time))
-
-                # Check if it's time for reminder
-                if [[ $time_diff -le $REMINDER_TIME && $time_diff -gt 0 ]]; then
-                    # Check if already processed
-                    local already_processed=false
-                    for processed in "${processed_events[@]}"; do
-                        if [[ "$processed" == "$event_id" ]]; then
-                            already_processed=true
-                            break
-                        fi
-                    done
-
-                    if [[ "$already_processed" == false ]]; then
-                        local time_left=$((time_diff / 60))
-                        local notification_text="$summary"
-
-                        if [[ -n "$location" ]]; then
-                            notification_text="$notification_text\nLocation: $location"
-                        fi
-
-                        if [[ -n "$description" ]]; then
-                            notification_text="$notification_text\n\n$description"
-                        fi
-
-                        notification_text="$notification_text\n\nTime: $datetime"
-
-                        if [[ $time_left -gt 0 ]]; then
-                            notification_text="$notification_text\nTime remaining: ${time_left} minutes"
-                        else
-                            notification_text="$notification_text\nEVENT IS NOW!"
-                        fi
-
-                        echo "$(date): Sending reminder: $summary"
-                        show_notification "📅 Calendar Reminder" "$notification_text" "$event_id"
-                        processed_events+=("$event_id")
-                    fi
-                fi
-            fi
-        done < <(parse_ics "$ICS_FILE")
-
-        if [[ "$events_found" == false && -f "$ICS_FILE" ]]; then
-            echo "$(date): No events found in $ICS_FILE"
-        fi
+        # Check for new notifications
+        mapfile -t new_notifications < <(check_and_notify "${processed_events[@]}")
+        processed_events+=("${new_notifications[@]}")
 
         sleep "$CHECK_INTERVAL"
     done
