@@ -16,14 +16,11 @@ Before using this script, install the required tools:
 
 ```bash
 # On Arch Linux
-sudo pacman -S yad
-
-# Install fyi (notification daemon)
-# Check your distribution's package manager or build from source
+sudo pacman -S yad fyi
 ```
 
 Required tools:
-- `yad` - For panel icons and dialog boxes
+- `yad` - For panel icons and dialog boxes (fork of zenity)
 - `fyi` - For desktop notifications (alternative to notify-send)
 - `awk` - For parsing .ics files (usually pre-installed)
 
